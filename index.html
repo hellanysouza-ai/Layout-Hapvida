@@ -288,6 +288,14 @@
       </div>
 
       <div class="table-wrap hidden" id="panel-repique-wrap" style="padding:0 22px;">
+        <div style="display:flex; align-items:center; gap:8px; padding:10px 0; font-size:12.5px;">
+          <label for="repiqueStatusFilter" style="color:var(--muted); font-weight:bold;">Filtrar por status:</label>
+          <select id="repiqueStatusFilter" style="border:1px solid var(--border); border-radius:6px; padding:5px 10px; font-size:12.5px; color:var(--text); background:#fff;">
+            <option value="todos">Todos</option>
+            <option value="ok">Somente OK</option>
+            <option value="nd">Somente ND</option>
+          </select>
+        </div>
         <table id="tableRepique">
           <thead><tr>
             <th>Proposta</th><th>Nome</th><th>Modalidade</th><th>Parcela</th>
@@ -544,6 +552,13 @@ function parsePercentAlice(raw){
   return Math.abs(n) > 1 ? n / 100 : n;
 }
 
+// Colunas Sim/Não da Hapvida: "N", "Não", vazio ou "0" contam como Não.
+function isAffirmative(v){
+  if(v === null || v === undefined) return false;
+  const s = normHeader(v);
+  return s !== '' && s !== 'n' && s !== 'nao' && s !== '0' && s !== 'não';
+}
+
 // Encontra a linha de cabecalho real (o arquivo pode ter linhas de resumo antes).
 function findHeaderRow(aoa){
   for(let i=0;i<Math.min(aoa.length,30);i++){
@@ -675,6 +690,48 @@ function processAll(){
   repiqueRows = [];
 
   operatorFiles.forEach(of => {
+    // A Hapvida também manda um formato dedicado de "Estorno avulso"
+    // (arquivos tipo "NOME ESTORNO"), com colunas totalmente diferentes do
+    // relatório de comissão normal (sem CD USUARIO/EMPRESA/PARCELA).
+    const headers0 = of.aoa[0] || [];
+    const norm0 = headers0.map(normHeader);
+    const isEstornoFormat = norm0.some(h => h.includes('codigo beneficiario')) &&
+                             norm0.some(h => h.includes('valor de comissao'));
+    if(isEstornoFormat){
+      const idxE = {
+        beneficiario: findColIndex(headers0, ['beneficiario']),
+        tipoComissao: findColIndex(headers0, ['tipo comissao']),
+        valorMensalidade: findColIndex(headers0, ['vl mensalidade']),
+        percentualMulta: findColIndex(headers0, ['% multa']),
+        valorComissao: findColIndex(headers0, ['valor de comissao']),
+        dtCancelamento: findColIndex(headers0, ['dt cancelamento']),
+        tipoAvulso: findColIndex(headers0, ['tipo de avulso'])
+      };
+      for(let i=1;i<of.aoa.length;i++){
+        const row = of.aoa[i];
+        if(!row) continue;
+        const beneficiario = idxE.beneficiario !== -1 ? (row[idxE.beneficiario] ?? '') : '';
+        const valorComissao = idxE.valorComissao !== -1 ? row[idxE.valorComissao] : null;
+        if(!String(beneficiario).trim() || valorComissao === null || valorComissao === undefined || valorComissao === '') continue;
+
+        const m = matchByName(beneficiario);
+        const tipoAvulso = idxE.tipoAvulso !== -1 ? (row[idxE.tipoAvulso] ?? '') : '';
+        const dtCancel = idxE.dtCancelamento !== -1 ? row[idxE.dtCancelamento] : '';
+        estornoRows.push({
+          id: uidCounter++,
+          proposta: m.proposta, nome: beneficiario,
+          modalidade: idxE.tipoComissao !== -1 ? (row[idxE.tipoComissao] ?? '') : '',
+          parcela: '',
+          valorParcela: round2(toNumber(idxE.valorMensalidade !== -1 ? row[idxE.valorMensalidade] : 0)),
+          percentual: parsePercentAlice(idxE.percentualMulta !== -1 ? row[idxE.percentualMulta] : 0),
+          comissaoEstimada: -Math.abs(round2(toNumber(valorComissao))),
+          motivo: (tipoAvulso || 'Estorno') + (dtCancel ? ` — cancelado em ${dtCancel}` : ''),
+          origem: 'informado'
+        });
+      }
+      return;
+    }
+
     const headerRowIdx = findHeaderRow(of.aoa);
     const headers = of.aoa[headerRowIdx];
     const idx = {
@@ -733,7 +790,8 @@ function processAll(){
       }
 
       // Repique: aba própria, com a proposta encontrada, não entra na soma do Pronto.
-      if(repiqueVal !== null && repiqueVal !== undefined && String(repiqueVal).trim() !== ''){
+      // A coluna vem como Sim/Não (ou em branco) — "N"/"Não"/vazio NÃO conta como repique.
+      if(isAffirmative(repiqueVal)){
         const m = matchByName(nomeParaMatch);
         repiqueRows.push({
           id: uidCounter++,
@@ -929,25 +987,54 @@ function renderPronto(){
 function renderRepique(){
   const body = document.getElementById('bodyRepique');
   body.innerHTML = '';
-  document.getElementById('emptyRepique').classList.toggle('hidden', repiqueRows.length>0);
-  repiqueRows.forEach(r => {
+  const filterEl = document.getElementById('repiqueStatusFilter');
+  const filter = filterEl ? filterEl.value : 'todos';
+  const filteredRows = repiqueRows.filter(r => {
+    if(filter === 'ok') return !r.nd;
+    if(filter === 'nd') return r.nd;
+    return true;
+  });
+  const emptyEl = document.getElementById('emptyRepique');
+  emptyEl.classList.toggle('hidden', filteredRows.length>0);
+  emptyEl.textContent = repiqueRows.length === 0
+    ? 'Nenhum repique identificado.'
+    : 'Nenhum repique com esse status.';
+  filteredRows.forEach(r => {
     const tr = document.createElement('tr');
     if(r.nd) tr.className = 'nd';
-    const tdProp = document.createElement('td'); tdProp.textContent = r.proposta; tr.appendChild(tdProp);
-    const tdNome = document.createElement('td'); tdNome.textContent = r.nome; tr.appendChild(tdNome);
-    const tdMod = document.createElement('td'); tdMod.textContent = r.modalidade; tr.appendChild(tdMod);
-    const tdParcela = document.createElement('td'); tdParcela.textContent = r.parcela; tr.appendChild(tdParcela);
-    const tdValor = document.createElement('td'); tdValor.className='num-cell'; tdValor.textContent = formatBR(r.valorParcela); tr.appendChild(tdValor);
-    const tdCom = document.createElement('td'); tdCom.className='num-cell'; tdCom.textContent = formatBR(r.comissao); tr.appendChild(tdCom);
-    const tdRep = document.createElement('td'); tdRep.textContent = r.repique; tr.appendChild(tdRep);
+    const editable = r.nd;
+
+    tr.appendChild(maybeEditableCell(editable, r.proposta, v => r.proposta = v.trim()));
+    tr.appendChild(maybeEditableCell(editable, r.nome, v => r.nome = v.trim()));
+    tr.appendChild(maybeEditableCell(editable, r.modalidade, v => r.modalidade = v.trim()));
+    tr.appendChild(maybeEditableCell(editable, r.parcela, v => r.parcela = v.trim()));
+
+    const tdValor = maybeEditableCell(editable, formatBR(r.valorParcela), v => { r.valorParcela = round2(parseEditedNumber(v)); });
+    tdValor.className = 'num-cell'; tr.appendChild(tdValor);
+
+    const tdCom = maybeEditableCell(editable, formatBR(r.comissao), v => { r.comissao = round2(parseEditedNumber(v)); });
+    tdCom.className = 'num-cell'; tr.appendChild(tdCom);
+
+    tr.appendChild(maybeEditableCell(editable, r.repique, v => r.repique = v.trim()));
+
     const tdStatus = document.createElement('td');
     tdStatus.innerHTML = r.nd ? '<span class="badge badge-nd">ND</span>' : '<span class="badge badge-ok">OK</span>';
     tr.appendChild(tdStatus);
+
     const tdActions = document.createElement('td');
     tdActions.className = 'rowactions';
     const delBtn = document.createElement('button');
     delBtn.className = 'icon-btn del'; delBtn.textContent = 'Excluir';
-    delBtn.onclick = () => { repiqueRows = repiqueRows.filter(x=>x.id!==r.id); renderRepique(); renderKpis(); };
+    delBtn.onclick = () => {
+      repiqueRows = repiqueRows.filter(x=>x.id!==r.id);
+      excludedRows.push({
+        id: uidCounter++,
+        proposta: r.proposta, nome: r.nome, modalidade: r.modalidade, parcela: r.parcela,
+        valorParcela: r.valorParcela,
+        motivo: r.nd ? 'Excluído manualmente (Repique ND — não localizado)' : 'Excluído manualmente (Repique)'
+      });
+      renderRepique(); renderExcluido(); renderKpis();
+    };
     tdActions.appendChild(delBtn);
     tr.appendChild(tdActions);
     body.appendChild(tr);
@@ -1020,6 +1107,7 @@ function renderExcluido(){
 
 // ---------- TABS ----------
 document.getElementById('statusFilter').addEventListener('change', () => { prontoPage = 1; renderPronto(); });
+document.getElementById('repiqueStatusFilter').addEventListener('change', renderRepique);
 document.getElementById('prontoPrevBtn').addEventListener('click', () => { prontoPage--; renderPronto(); });
 document.getElementById('prontoNextBtn').addEventListener('click', () => { prontoPage++; renderPronto(); });
 
