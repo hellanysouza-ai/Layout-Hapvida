@@ -234,7 +234,7 @@
 
       <div style="padding:18px 22px 0;">
         <div class="tabpanel active" id="panel-pronto">
-          <div class="note">O cruzamento é feito pelo <strong>nome</strong> — Razão Empresarial (PME) ou nome do membro (PF) — contra o Segurado da Base Sis, com correspondência aproximada de até 85% quando não há nome exatamente igual. Linhas em <strong>amarelo</strong> (ND) não foram localizadas; linhas em <strong>azul</strong> tiveram correspondência aproximada (confira o nome sugerido). Ambas podem ser editadas ou excluídas. PME agrupa por Razão Empresarial + Parcela; PF agrupa pelos 5 dígitos do CD USUARIO após o código da empresa + Parcela.</div>
+          <div class="note">O cruzamento é feito pelo <strong>nome</strong> — Razão Empresarial (PME) ou nome do membro (PF) — contra o Segurado da Base Sis, com correspondência aproximada de até 85% quando não há nome exatamente igual. Linhas em <strong>amarelo</strong> (ND) não foram localizadas; linhas em <strong>azul</strong> tiveram correspondência aproximada (confira o nome sugerido). Ambas podem ser editadas e <strong>precisam do botão "Autorizar" para entrar no TXT/Excel de subida</strong> — sem autorizar, ficam de fora mesmo com a proposta preenchida. PME agrupa por Razão Empresarial + Parcela; PF agrupa pelos 5 dígitos do CD USUARIO após o código da empresa + Parcela.</div>
         </div>
         <div class="tabpanel" id="panel-estorno">
           <div class="note">Linhas com Valor a Receber negativo — separadas do layout principal.</div>
@@ -256,7 +256,10 @@
               <option value="ok">Somente OK</option>
               <option value="fuzzy">Somente aproximado</option>
               <option value="nd">Somente ND</option>
+              <option value="pendente">Pendentes de autorização</option>
+              <option value="autorizado">Autorizados manualmente</option>
             </select>
+            <button class="icon-btn del" id="prontoBulkDeleteBtn" title="Exclui todas as linhas do filtro atual de uma vez (vão para a aba Excluídos)">Excluir todos os filtrados</button>
           </div>
           <div style="display:flex; align-items:center; gap:8px;" id="prontoPagination">
             <button class="icon-btn" id="prontoPrevBtn">‹ Anterior</button>
@@ -644,6 +647,23 @@ function findFuzzyMatch(query, tokenIndex, threshold){
   return null;
 }
 
+// Nomes abreviados de formas sistemáticas escapam do fuzzy match comum:
+// "SIMMER & DITTRICH SERVICOS MEDICOS" -> "SIMMER E D S MEDICOS" (palavras do
+// meio viram inicial) ou "DHON'S FASHION LTDA" -> "DHON S FASHION LTDA"
+// (pontuação vira espaço). Essas duas camadas pegam esses casos antes do fuzzy.
+const NAME_CONNECTORS = new Set(['E','DE','DA','DO','DOS','DAS']);
+function buildAcronymSignature(name){
+  const tokens = String(name || '').replace(/&/g, ' E ').split(' ').filter(Boolean).filter(t => !NAME_CONNECTORS.has(t));
+  if(tokens.length <= 1) return tokens.join('');
+  const first = tokens[0];
+  const last = tokens[tokens.length - 1];
+  const middle = tokens.slice(1, -1).map(t => t[0]);
+  return [first, ...middle, last].join('');
+}
+function squashName(name){
+  return String(name || '').replace(/[^A-Z0-9]/g, '');
+}
+
 function processAll(){
   document.getElementById('statusMsg').textContent = 'Processando...';
 
@@ -666,6 +686,14 @@ function processAll(){
   });
   const sisNames = [...sisNameToProp.keys()];
   const sisNameIndex = buildNameIndex(sisNames);
+  const sisSigToProp = new Map();
+  const sisSquashToProp = new Map();
+  sisNames.forEach(n => {
+    const sig = buildAcronymSignature(n);
+    if(sig && !sisSigToProp.has(sig)) sisSigToProp.set(sig, sisNameToProp.get(n));
+    const sq = squashName(n);
+    if(sq && !sisSquashToProp.has(sq)) sisSquashToProp.set(sq, sisNameToProp.get(n));
+  });
   const matchCache = new Map();
 
   function matchByName(rawName){
@@ -674,6 +702,11 @@ function processAll(){
     let result;
     if(sisNameToProp.has(key)){
       result = { proposta: sisNameToProp.get(key), nd: false, fuzzy: false };
+    } else if(sisSquashToProp.has(squashName(key))){
+      result = { proposta: sisSquashToProp.get(squashName(key)), nd: false, fuzzy: true, fuzzyScore: 0.95, fuzzyName: '(ignorando pontuação)' };
+    } else if(sisSigToProp.has(buildAcronymSignature(key))){
+      const sig = buildAcronymSignature(key);
+      result = { proposta: sisSigToProp.get(sig), nd: false, fuzzy: true, fuzzyScore: 0.9, fuzzyName: '(sigla: ' + sig + ')' };
     } else {
       const fuzzy = findFuzzyMatch(key, sisNameIndex, 0.85);
       result = fuzzy
@@ -905,6 +938,8 @@ function renderPronto(){
     if(filter === 'ok') return !r.nd && !r.fuzzy;
     if(filter === 'fuzzy') return !r.nd && r.fuzzy;
     if(filter === 'nd') return r.nd;
+    if(filter === 'pendente') return (r.nd || r.fuzzy) && !r.authorized;
+    if(filter === 'autorizado') return (r.nd || r.fuzzy) && r.authorized;
     return true;
   });
   const emptyEl = document.getElementById('emptyPronto');
@@ -952,14 +987,30 @@ function renderPronto(){
     tdCom.className = 'num-cell'; tr.appendChild(tdCom);
 
     const tdStatus = document.createElement('td');
-    if(r.nd) tdStatus.innerHTML = '<span class="badge badge-nd">ND</span>';
-    else if(r.fuzzy) tdStatus.innerHTML = `<span class="badge" style="background:#E3EEFB;color:#2A5D9C;" title="Nome mais próximo: ${(r.fuzzyName||'').replace(/"/g,'')}">Fuzzy ${Math.round(r.fuzzyScore*100)}%</span>`;
+    if(r.nd) tdStatus.innerHTML = r.authorized
+      ? '<span class="badge badge-nd">ND</span> <span class="badge badge-ok" title="Autorizado manualmente para subir">✓ Autorizado</span>'
+      : '<span class="badge badge-nd">ND</span>';
+    else if(r.fuzzy) tdStatus.innerHTML = r.authorized
+      ? `<span class="badge" style="background:#E3EEFB;color:#2A5D9C;" title="Nome mais próximo: ${(r.fuzzyName||'').replace(/"/g,'')}">Fuzzy ${Math.round(r.fuzzyScore*100)}%</span> <span class="badge badge-ok" title="Autorizado manualmente para subir">✓ Autorizado</span>`
+      : `<span class="badge" style="background:#E3EEFB;color:#2A5D9C;" title="Nome mais próximo: ${(r.fuzzyName||'').replace(/"/g,'')}">Fuzzy ${Math.round(r.fuzzyScore*100)}%</span>`;
     else tdStatus.innerHTML = '<span class="badge badge-ok">OK</span>';
     tr.appendChild(tdStatus);
 
     const tdActions = document.createElement('td');
     tdActions.className = 'rowactions';
     if(editable){
+      const authBtn = document.createElement('button');
+      if(r.authorized){
+        authBtn.className = 'icon-btn restore'; authBtn.textContent = 'Revogar';
+        authBtn.title = 'Remove a autorização — a linha volta a ficar de fora do TXT/Excel até ser revisada de novo.';
+      } else {
+        authBtn.className = 'icon-btn'; authBtn.style.color = 'var(--ok)'; authBtn.style.borderColor = 'var(--ok)';
+        authBtn.textContent = 'Autorizar';
+        authBtn.title = 'Confirma que a proposta/nome está correto e libera esta linha para o TXT/Excel de subida.';
+      }
+      authBtn.onclick = () => { r.authorized = !r.authorized; renderPronto(); renderKpis(); };
+      tdActions.appendChild(authBtn);
+
       const delBtn = document.createElement('button');
       delBtn.className = 'icon-btn del'; delBtn.textContent = 'Excluir';
       delBtn.onclick = () => {
@@ -1111,6 +1162,37 @@ document.getElementById('repiqueStatusFilter').addEventListener('change', render
 document.getElementById('prontoPrevBtn').addEventListener('click', () => { prontoPage--; renderPronto(); });
 document.getElementById('prontoNextBtn').addEventListener('click', () => { prontoPage++; renderPronto(); });
 
+document.getElementById('prontoBulkDeleteBtn').addEventListener('click', () => {
+  const filterEl = document.getElementById('statusFilter');
+  const filter = filterEl ? filterEl.value : 'todos';
+  const toDelete = readyRows.filter(r => {
+    if(filter === 'ok') return !r.nd && !r.fuzzy;
+    if(filter === 'fuzzy') return !r.nd && r.fuzzy;
+    if(filter === 'nd') return r.nd;
+    if(filter === 'pendente') return (r.nd || r.fuzzy) && !r.authorized;
+    if(filter === 'autorizado') return (r.nd || r.fuzzy) && r.authorized;
+    return true;
+  });
+  if(toDelete.length === 0){ showToast('Não há linhas no filtro atual para excluir.'); return; }
+  if(!confirm(`Excluir ${toDelete.length} linha(s) do filtro atual? Elas vão para a aba Excluídos.`)) return;
+  const toDeleteIds = new Set(toDelete.map(r => r.id));
+  readyRows = readyRows.filter(r => !toDeleteIds.has(r.id));
+  toDelete.forEach(r => {
+    excludedRows.push({
+      id: uidCounter++,
+      proposta: r.proposta, nome: r.nome, modalidade: r.modalidade, parcela: r.parcela,
+      valorParcela: r.valorParcela,
+      motivo: r.nd
+        ? 'Excluído em massa (ND — não localizado)'
+        : (r.fuzzy
+          ? `Excluído em massa após revisão de correspondência aproximada (${Math.round(r.fuzzyScore*100)}% com "${r.fuzzyName}")`
+          : 'Excluído em massa')
+    });
+  });
+  renderPronto(); renderExcluido(); renderKpis();
+  showToast(`${toDelete.length} linha(s) excluída(s).`);
+});
+
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -1201,12 +1283,20 @@ async function downloadWorkbook(wb, filename){
   a.click();
 }
 
+// Linhas ND ou Fuzzy só entram no TXT/Excel de subida depois de autorizadas
+// manualmente — evita que uma correspondência aproximada errada suba sem revisão.
+function isExportable(r){
+  return (!r.nd && !r.fuzzy) || r.authorized;
+}
+
 document.getElementById('btnExportExcel').addEventListener('click', async () => {
-  if(readyRows.length === 0){ showToast('Não há linhas prontas para exportar.'); return; }
+  const exportRows = readyRows.filter(isExportable);
+  if(exportRows.length === 0){ showToast('Não há linhas liberadas para exportar (autorize as ND/Fuzzy pendentes).'); return; }
+  const pending = readyRows.length - exportRows.length;
   const wb = new ExcelJS.Workbook();
 
   const headers = ['Proposta ',' Nome da Empresa ',' Modalidade ',' Parcela ',' Valor da Proposta ',' Porcentagem ',' Valor da Comissão'];
-  const rows = readyRows.map(r => ({
+  const rows = exportRows.map(r => ({
     values: [r.proposta, r.nome, r.modalidade, r.parcela, round2(r.valorParcela), r.percentual, round2(r.comissao)],
     highlight: r.nd
   }));
@@ -1223,13 +1313,15 @@ document.getElementById('btnExportExcel').addEventListener('click', async () => 
   }
 
   await downloadWorkbook(wb, `Layout_Hapvida_${dateStamp()}.xlsx`);
-  showToast('Excel exportado.');
+  showToast(pending > 0 ? `Excel exportado (${pending} linha(s) ND/Fuzzy pendente de autorização ficaram de fora).` : 'Excel exportado.');
 });
 
 document.getElementById('btnExportTxt').addEventListener('click', () => {
-  if(readyRows.length === 0){ showToast('Não há linhas prontas para exportar.'); return; }
+  const exportRows = readyRows.filter(isExportable);
+  if(exportRows.length === 0){ showToast('Não há linhas liberadas para exportar (autorize as ND/Fuzzy pendentes).'); return; }
+  const pending = readyRows.length - exportRows.length;
   const lines = ['SisWeb#Importacao de parcelas'];
-  readyRows.forEach(r => {
+  exportRows.forEach(r => {
     lines.push([r.proposta, r.nome, r.modalidade, r.parcela, formatBR(r.valorParcela), formatBR(r.percentual), formatBR(r.comissao)].join('#'));
   });
   const content = '\ufeff' + lines.join('\r\n') + '\r\n';
