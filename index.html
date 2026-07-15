@@ -240,7 +240,7 @@
           <div class="note">Linhas com Valor a Receber negativo — separadas do layout principal.</div>
         </div>
         <div class="tabpanel" id="panel-repique">
-          <div class="note">Linhas com valor preenchido na coluna Repique, com a Proposta já cruzada na Base Sis. Não entram na soma do layout principal.</div>
+          <div class="note">Quando a mesma proposta tem um beneficiário com Valor e Comissão <strong>zerados</strong> junto de outro beneficiário com valor real, o zerado é considerado repique — sai da soma do Pronto e vai pra cá, com a Proposta já cruzada na Base Sis.</div>
         </div>
         <div class="tabpanel" id="panel-excluido">
           <div class="note">Linhas excluídas manualmente da aba "Pronto" (após revisão de ND ou correspondência aproximada) ficam registradas aqui, para exportar e conferir depois.</div>
@@ -786,6 +786,9 @@ function processAll(){
     // Grupos por (identidade, parcela): PME agrupa por nome da empresa;
     // PF agrupa pelos 5 dígitos do CD USUARIO logo após "<CD EMPRESA>0"
     // (assim titular e dependentes da mesma proposta ficam juntos).
+    // Guarda cada beneficiário separadamente dentro do grupo (em vez de já
+    // somar), porque a regra de repique precisa comparar os valores entre
+    // eles antes de decidir o que soma e o que vai pra aba de Repique.
     const groups = new Map();
 
     for(let i=headerRowIdx+1;i<of.aoa.length;i++){
@@ -802,7 +805,6 @@ function processAll(){
       const parcela = idx.parcela !== -1 ? row[idx.parcela] : '';
       const valor = idx.valor !== -1 ? row[idx.valor] : 0;
       const percentual = idx.percentual !== -1 ? parsePercentAlice(row[idx.percentual]) : 0;
-      const repiqueVal = idx.repique !== -1 ? row[idx.repique] : null;
 
       let nomeParaMatch, nomeExibir, localKey;
       if(isIndividual){
@@ -822,19 +824,6 @@ function processAll(){
         localKey = 'PME||' + normName(empresaRaw) + '||' + String(parcela).trim();
       }
 
-      // Repique: aba própria, com a proposta encontrada, não entra na soma do Pronto.
-      // A coluna vem como Sim/Não (ou em branco) — "N"/"Não"/vazio NÃO conta como repique.
-      if(isAffirmative(repiqueVal)){
-        const m = matchByName(nomeParaMatch);
-        repiqueRows.push({
-          id: uidCounter++,
-          proposta: m.proposta, nome: nomeExibir, modalidade: isIndividual ? 'PF' : 'PME',
-          parcela, valorParcela: round2(toNumber(valor)), comissao: round2(toNumber(comissao)),
-          repique: String(repiqueVal), nd: m.nd
-        });
-        continue;
-      }
-
       const negativo = isNumericRaw(comissao) && toNumber(comissao) < 0;
       if(negativo){
         const m = matchByName(nomeParaMatch);
@@ -849,25 +838,45 @@ function processAll(){
       }
 
       if(!groups.has(localKey)){
-        const m = matchByName(nomeParaMatch);
         groups.set(localKey, {
-          proposta: m.proposta, nd: m.nd, fuzzy: m.fuzzy, fuzzyScore: m.fuzzyScore, fuzzyName: m.fuzzyName,
-          nome: nomeExibir, modalidade: isIndividual ? 'PF' : 'PME', parcela, percentual,
-          valorParcela: 0, comissao: 0
+          nomeParaMatch, nomeExibir, isIndividual, parcela, percentual, rows: []
         });
       }
-      const g = groups.get(localKey);
-      g.valorParcela += toNumber(valor);
-      g.comissao += toNumber(comissao);
+      groups.get(localKey).rows.push({ nome: nomeExibir, valor: toNumber(valor), comissao: toNumber(comissao) });
     }
 
+    // Repique: quando a mesma proposta (mesmo grupo) tem um beneficiário
+    // zerado (Valor e Comissão = 0) junto de outro com valor real, o
+    // beneficiário zerado é repique — sai do grupo e vai pra aba própria,
+    // sem entrar na soma do Pronto.
     groups.forEach(g => {
+      const temValorReal = g.rows.some(r => r.valor !== 0 || r.comissao !== 0);
+      const temZerado = g.rows.some(r => r.valor === 0 && r.comissao === 0);
+      const isRepiqueGroup = g.rows.length > 1 && temValorReal && temZerado;
+
+      if(isRepiqueGroup){
+        const m = matchByName(g.nomeParaMatch);
+        g.rows.filter(r => r.valor === 0 && r.comissao === 0).forEach(r => {
+          repiqueRows.push({
+            id: uidCounter++,
+            proposta: m.proposta, nome: r.nome, modalidade: g.isIndividual ? 'PF' : 'PME',
+            parcela: g.parcela, valorParcela: 0, comissao: 0,
+            repique: 'Mesma proposta com beneficiário zerado', nd: m.nd
+          });
+        });
+        g.rows = g.rows.filter(r => !(r.valor === 0 && r.comissao === 0));
+        if(g.rows.length === 0) return;
+      }
+
+      const m = matchByName(g.nomeParaMatch);
+      const valorParcela = g.rows.reduce((s,r) => s + r.valor, 0);
+      const comissao = g.rows.reduce((s,r) => s + r.comissao, 0);
       readyRows.push({
         id: uidCounter++,
-        proposta: g.proposta, nome: g.nome, modalidade: g.modalidade, parcela: g.parcela,
-        valorParcela: round2(g.valorParcela), percentual: g.percentual,
-        comissao: round2(g.comissao), nd: g.nd,
-        fuzzy: g.fuzzy, fuzzyScore: g.fuzzyScore, fuzzyName: g.fuzzyName
+        proposta: m.proposta, nome: g.nomeExibir, modalidade: g.isIndividual ? 'PF' : 'PME', parcela: g.parcela,
+        valorParcela: round2(valorParcela), percentual: g.percentual,
+        comissao: round2(comissao), nd: m.nd,
+        fuzzy: m.fuzzy, fuzzyScore: m.fuzzyScore, fuzzyName: m.fuzzyName
       });
     });
   });
